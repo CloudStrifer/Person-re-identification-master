@@ -1,0 +1,27 @@
+{
+  "verified_date": "2026-11-10",
+  "license": "MIT (OpenAI CLIP)",
+  "assets": [
+    {
+      "source": "https://raw.githubusercontent.com/openai/CLIP/main/clip/bpe_simple_vocab_16e6.txt.gz",
+      "path": "data/bpe_simple_vocab_16e6.txt.gz",
+      "sha256": "924691ac288e54409236115652ad4aa250f48203de50a9e4722a6ecd48d6804a",
+      "bytes": 1356917,
+      "action": "existing file verified against official source; content unchanged"
+    },
+    {
+      "source": "https://raw.githubusercontent.com/openai/CLIP/main/LICENSE",
+      "path": "data/CLIP_LICENSE.txt",
+      "sha256": "987e63b32f6c89ff5160e429458a872ff048e6860b590a3912e938f9da8f14db",
+      "bytes": 1064,
+      "action": "downloaded from official source"
+    },
+    {
+      "source": "https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt",
+      "path": ".recovery/model_cache/ViT-B-16.pt",
+      "sha256": "5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f",
+      "bytes": 350837078,
+      "action": "downloaded official model for stage1 real-data validation"
+    }
+  ]
+}

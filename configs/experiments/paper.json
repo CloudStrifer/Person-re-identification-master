@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "common": {
+    "seed": 42, "num_epoch": 30, "warmup_epochs": 5,
+    "batch_size": 64, "test_batch_size": 128, "num_instance": 4,
+    "sampler": "identity", "optimizer": "Adam", "lr": 0.00001,
+    "head_lr": 0.0001, "weight_decay": 0.00004, "lrscheduler": "cosine",
+    "img_size": [384, 128], "text_length": 77, "stride_size": 16,
+    "loss_names": "sdm+id", "label_smoothing": 0.1,
+    "temperature": 0.02, "noise_threshold": 0.7, "generator_depth": 6,
+    "cmt_depth": 4, "gen_loss_weight": 0.5, "nac_corruption_rate": 0.15,
+    "a2dfp_embed_dim": 2048, "a2dfp_blend_weight": 0.5,
+    "cdfp_margin": 0.1, "cdfp_k_negatives": 2, "cdfp_loss_weight": 0.1,
+    "device": "cuda", "precision": "fp32", "num_workers": 4
+  },
+  "targets": ["CUHK-PEDES", "ICFG-PEDES", "RSTPReid"],
+  "source_augmentation": "none",
+  "module_profiles": {
+    "baseline": {"use_nac": false, "use_a2dfp": false, "use_cdfp": false},
+    "nac": {"use_nac": true, "use_a2dfp": false, "use_cdfp": false},
+    "nac_a2dfp": {"use_nac": true, "use_a2dfp": true, "use_cdfp": false},
+    "nac_cdfp": {"use_nac": true, "use_a2dfp": false, "use_cdfp": true},
+    "pretrain": {"use_nac": false, "use_a2dfp": true, "use_cdfp": true},
+    "full": {"use_nac": true, "use_a2dfp": true, "use_cdfp": true}
+  },
+  "module_ablation": [
+    {"id": "baseline", "modules": "baseline", "augmentation": "none", "paper_table": "5 row 1; 8 row 1"},
+    {"id": "dual", "modules": "baseline", "augmentation": "both", "paper_table": "5 row 2; 8 row 5"},
+    {"id": "dual_nac", "modules": "nac", "augmentation": "both", "paper_table": "5 row 3; 8 row 6; 12 global"},
+    {"id": "dual_nac_a2dfp", "modules": "nac_a2dfp", "augmentation": "both", "paper_table": "5 row 4; 12 A2DFP"},
+    {"id": "dual_nac_cdfp", "modules": "nac_cdfp", "augmentation": "both", "paper_table": "5 row 5; 12 CDFP"},
+    {"id": "full", "modules": "full", "augmentation": "both", "paper_table": "5 row 6; 8 row 7; 12 joint"}
+  ],
+  "augmentation_ablation": [
+    {"id": "text_only", "modules": "baseline", "augmentation": "text", "paper_table": "8 row 2"},
+    {"id": "image_only", "modules": "baseline", "augmentation": "image", "paper_table": "8 row 3"},
+    {"id": "dual_unfiltered", "modules": "baseline", "augmentation": "unfiltered", "paper_table": "8 row 4"}
+  ],
+  "sensitivity": {
+    "cdfp_margin": [0, 0.05, 0.1, 0.15, 0.2, 0.3],
+    "a2dfp_blend_weight": [0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0],
+    "cdfp_k_negatives": [1, 2, 4, 8, 16],
+    "noise_threshold": [0.5, 0.6, 0.7, 0.8, 0.9]
+  },
+  "implementation_conventions": [
+    "SYNTH source pretraining uses A2DFP/CDFP with NAC disabled because synthetic captions have no aligned clean NAC target; target finetuning initializes NAC explicitly.",
+    "SYNTH uses the complete released source annotations without further offline expansion by default; the paper does not specify source expansion. Target full experiments use dual expansion.",
+    "Table 5/8 supported ablations share a baseline-only SYNTH checkpoint; added modules initialize explicitly. The paper does not specify common initialization.",
+    "All compared training variants use the same identity sampler and K=4.",
+    "Unfiltered augmentation requires an independently prepared unfiltered manifest; a filtered manifest cannot stand in for that arm.",
+    "Source checkpoint selection uses the final fixed-schedule epoch; target selection uses official validation R1 when available, otherwise the final epoch.",
+    "Training settings shared across source and targets where the paper gives no separate source schedule; record this as a recovery convention.",
+    "SDM temperature 0.02 is inherited from the recovered baseline, not the ambiguous CDFP temperature mentioned in the paper."
+  ],
+  "unsupported_experiments": [
+    "Table 9 random-mask / without-visual / without-repair NAC variants",
+    "Table 12 static local-average pooling",
+    "Full/partial SYNTH pretraining scale comparison; requires explicit independently defined source subsets"
+  ]
+}

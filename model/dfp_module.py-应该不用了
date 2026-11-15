@@ -1,0 +1,327 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+def l2norm(X, dim=-1, eps=1e-8):
+    """L2-normalize columns of X"""
+    norm = torch.pow(X, 2).sum(dim=dim, keepdim=True).sqrt() + eps
+    X = torch.div(X, norm)
+    return X
+
+
+def maxk_pool1d_var(x, dim, k, lengths):
+    """Max pooling with variable lengths"""
+    results = list()
+    lengths = list(lengths.cpu().numpy())
+    lengths = [int(x) for x in lengths]
+    for idx, length in enumerate(lengths):
+        k_val = min(k, length)
+        max_k_i = maxk(x[idx, :length, :], dim - 1, k_val).mean(dim - 1)
+        results.append(max_k_i)
+    results = torch.stack(results, dim=0)
+    return results
+
+
+def maxk(x, dim, k):
+    """Get top-k values along dimension"""
+    index = x.topk(k, dim=dim)[1]
+    return x.gather(dim, index)
+
+
+class DynamicLinearProjection_FP16(nn.Module):
+    """Dynamic linear projection optimized for FP16"""
+
+    def __init__(self, input_dim=512, output_dim=2048, k=96, max_rows=8):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.k = k
+        self.max_rows = max_rows
+        self.max_dynamic_rows = 128
+
+        # Use float32 for linear layers to ensure compatibility with FP16
+        self.linear = nn.Linear(input_dim, output_dim).float()
+        self.linears = nn.ModuleDict()
+        self.weights = nn.ParameterDict()
+        self.biases = nn.ParameterDict()
+
+        for i in range(1, max_rows + 1):
+            self.linears[f'linear_{i}'] = nn.Linear(k * i, output_dim).float()
+            self.weights[f'weight_{i}'] = nn.Parameter(torch.randn(i, input_dim).float())
+            self.biases[f'bias_{i}'] = nn.Parameter(torch.zeros(i).float())
+
+    def forward(self, x, output_rows):
+        # Store original dtype
+        x_dtype = x.dtype
+        # Always work in float32
+        x = x.float()
+
+        if output_rows <= self.max_rows:
+            weight = self.weights[f'weight_{output_rows}'].float()
+            bias = self.biases[f'bias_{output_rows}'].float()
+            linear = self.linears[f'linear_{output_rows}'].float()
+
+            x = F.linear(x, weight, bias).transpose(0, 1)
+            x = linear(x)
+            return x.to(x_dtype)
+
+        elif output_rows > self.max_rows and output_rows <= self.max_dynamic_rows:
+            x = x.float().transpose(0, 1)
+            weight = torch.randn(output_rows, x.size(1), dtype=torch.float32, device=x.device)
+            bias = torch.zeros(output_rows, dtype=torch.float32, device=x.device)
+            x = F.linear(x, weight, bias).transpose(0, 1)
+            x = self.linear(x.float()).float()
+            return x.to(x_dtype)
+
+        else:
+            raise ValueError(f"output_rows must be between 1 and {self.max_dynamic_rows}, got {output_rows}")
+
+
+class MLP(nn.Module):
+    """Multi-layer perceptron for feature transformation"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.bns = nn.ModuleList(nn.BatchNorm1d(k) for k in h + [output_dim])
+
+    def forward(self, x):
+        # Store original dtype
+        x_dtype = x.dtype
+        # Work in float32
+        x = x.float()
+
+        B, N, D = x.size()
+        x = x.reshape(B * N, D)
+        for i, (bn, layer) in enumerate(zip(self.bns, self.layers)):
+            x = layer(x).float()
+            if i < self.num_layers - 1:
+                x = F.relu(bn(x.float())).float()
+            else:
+                x = bn(x.float()).float()
+        x = x.view(B, N, self.output_dim)
+        return x.to(x_dtype)
+
+
+class TexualEmbeddingLayer(nn.Module):
+    """Text embedding layer with DFP enhancement"""
+
+    def __init__(self, input_dim=512, embed_dim=2048, ratio=0.3, max_rows=8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.input_dim = input_dim
+        self.ratio = ratio
+        self.max_rows = max_rows
+
+        self.linear = nn.Linear(input_dim, embed_dim).float()
+        self.mlp = MLP(input_dim, embed_dim // 2, embed_dim, 2)
+        self.dynamic_proj = DynamicLinearProjection_FP16(
+            input_dim=input_dim,
+            output_dim=embed_dim,
+            k=30,
+            max_rows=max_rows
+        )
+
+    def forward(self, features, text, atten, pid):
+        """
+        Args:
+            features: [batch_size, seq_len, input_dim]
+            text: [batch_size, seq_len] token ids
+            atten: [batch_size, seq_len, seq_len] attention weights
+            pid: [batch_size] person ids
+        """
+        device = features.device
+        x_dtype = features.dtype
+
+        # Convert to float32 for processing
+        features = features.float()
+        text = text.float() if text.dtype in [torch.float16, torch.float32] else text.float()
+        atten = atten.float()
+        pid = pid.to(device)
+
+        mask = (text != 0).float()
+        lengths = mask.sum(1) - 2  # -2 for SOS and EOS
+        k = min(int((atten.size(1) - 2) * 0.4), 30)
+        bs = features.size(0)
+
+        # Process attention
+        batch_idx = torch.arange(bs, device=device)
+        end_positions = text.argmax(dim=-1)
+        atten[batch_idx, :, end_positions] = -1
+        atten[batch_idx, :, 0] = -1
+        atten = atten[batch_idx, end_positions, :]
+        atten = atten * mask
+
+        # Get top-k attention indices
+        if k > 0 and atten.size(1) > 0:
+            atten_topK = atten.topk(dim=-1, k=min(k, atten.size(1)))[1].unsqueeze(-1).expand(bs, min(k, atten.size(1)),
+                                                                                             features.size(2))
+            features = torch.gather(input=features, dim=1, index=atten_topK)
+        else:
+            return features.to(x_dtype)
+
+        # Create PID-based grouping
+        pid_reshaped = pid.reshape((bs, 1))
+        pid_dist = pid_reshaped - pid_reshaped.t()
+        labels = (pid_dist == 0).float()
+        mask_neg = 1 - labels
+
+        mask_row_sum = (1 - mask_neg).sum(1)
+        indices = (mask_row_sum >= 1).nonzero(as_tuple=True)[0]
+
+        if len(indices) == 0:
+            return features.to(x_dtype)
+
+        zero_positions = [(idx.item(), ((mask_neg)[idx] == 0).nonzero(as_tuple=True)[0].tolist())
+                          for idx in indices]
+
+        seen = set()
+        result = []
+        for item in zero_positions:
+            list_as_tuple = tuple(item[1])
+            if list_as_tuple not in seen:
+                seen.add(list_as_tuple)
+                result.append(item)
+
+        # Dynamic projection
+        features_cat_page_group = []
+        for col_num, many_text_is_one_pid in result:
+            selected_matrices = [features[i] for i in many_text_is_one_pid]
+            features_cat_page_group.append(torch.cat(selected_matrices, dim=0))
+
+        if len(features_cat_page_group) > 0:
+            dynamic_proj_group = [self.dynamic_proj(features_cat_page_group[i], len(result[i][1]))
+                                  for i in range(len(result))]
+            new_base_features = torch.cat(dynamic_proj_group, dim=0)
+
+            # Reconstruct output
+            output = torch.zeros(new_base_features.size(0), self.embed_dim, device=device, dtype=torch.float32)
+            for (k_idx, indices_list), tensor in zip(result, dynamic_proj_group):
+                for i, idx in enumerate(indices_list):
+                    output[idx] = tensor[i].float()
+            new_base_features = output
+        else:
+            new_base_features = torch.zeros(bs, self.embed_dim, device=device, dtype=torch.float32)
+
+        # Normalize and apply MLP
+        features = l2norm(features, dim=-1)
+        lengths_clamped = torch.Tensor(
+            [min(lengths[i].item() if lengths[i].dtype in [torch.int64, torch.int32] else int(lengths[i]), k)
+             for i in range(bs)]).to(device)
+        features_mlp = self.mlp(features)
+        features_pooled = maxk_pool1d_var(features_mlp, 1, 1, lengths_clamped)
+
+        new_base_features = l2norm(new_base_features, dim=-1)
+        output_features = features_pooled + new_base_features
+
+        return output_features.to(x_dtype)
+
+
+class VisualEmbeddingLayer(nn.Module):
+    """Visual embedding layer with DFP enhancement"""
+
+    def __init__(self, input_dim=512, embed_dim=2048, ratio=0.3, max_rows=8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.input_dim = input_dim
+        self.ratio = ratio
+        self.max_rows = max_rows
+
+        self.linear = nn.Linear(input_dim, embed_dim).float()
+        self.mlp = MLP(input_dim, embed_dim // 2, embed_dim, 2)
+        self.dynamic_proj = DynamicLinearProjection_FP16(
+            input_dim=input_dim,
+            output_dim=embed_dim,
+            k=int(192 * 0.5),
+            max_rows=max_rows
+        )
+
+    def forward(self, base_features, atten, pid):
+        """
+        Args:
+            base_features: [batch_size, num_patches, input_dim]
+            atten: [batch_size, num_heads, num_patches, num_patches] attention weights
+            pid: [batch_size] person ids
+        """
+        device = base_features.device
+        x_dtype = base_features.dtype
+
+        # Convert to float32 for processing
+        base_features = base_features.float()
+        atten = atten.float()
+        pid = pid.to(device)
+
+        k = int((atten.size(1) - 1) * 0.5)
+        bs = base_features.size(0)
+
+        # Process attention - mask CLS token
+        batch_idx = torch.arange(bs, device=device)
+        atten[batch_idx, :, 0] = -1
+
+        # Get top-k attention
+        if k > 0:
+            atten_topK = atten[:, 0].topk(dim=-1, k=min(k, atten.size(-1)))[1]
+            atten_topK = atten_topK.unsqueeze(-1).expand(bs, min(k, atten.size(-1)), base_features.size(2))
+            features = torch.gather(input=base_features, dim=1, index=atten_topK)
+        else:
+            return base_features.to(x_dtype)
+
+        # Create PID-based grouping
+        pid_reshaped = pid.reshape((bs, 1))
+        pid_dist = pid_reshaped - pid_reshaped.t()
+        labels = (pid_dist == 0).float()
+        mask_neg = 1 - labels
+
+        mask_row_sum = (1 - mask_neg).sum(1)
+        indices = (mask_row_sum >= 1).nonzero(as_tuple=True)[0]
+
+        if len(indices) == 0:
+            return base_features.to(x_dtype)
+
+        zero_positions = [(idx.item(), ((mask_neg)[idx] == 0).nonzero(as_tuple=True)[0].tolist())
+                          for idx in indices]
+
+        seen = set()
+        result = []
+        for item in zero_positions:
+            list_as_tuple = tuple(item[1])
+            if list_as_tuple not in seen:
+                seen.add(list_as_tuple)
+                result.append(item)
+
+        # Dynamic projection
+        features_cat_page_group = []
+        for col_num, many_text_is_one_pid in result:
+            selected_matrices = [features[i] for i in many_text_is_one_pid]
+            features_cat_page_group.append(torch.cat(selected_matrices, dim=0))
+
+        if len(features_cat_page_group) > 0:
+            dynamic_proj_group = [self.dynamic_proj(features_cat_page_group[i], len(result[i][1]))
+                                  for i in range(len(result))]
+            new_base_features = torch.cat(dynamic_proj_group, dim=0)
+
+            # Reconstruct output
+            output = torch.zeros(new_base_features.size(0), self.embed_dim, device=device, dtype=torch.float32)
+            for (k_idx, indices_list), tensor in zip(result, dynamic_proj_group):
+                for i, idx in enumerate(indices_list):
+                    output[idx] = tensor[i].float()
+            new_base_features = output
+        else:
+            new_base_features = torch.zeros(bs, self.embed_dim, device=device, dtype=torch.float32)
+
+        # Normalize and apply MLP
+        features = l2norm(features, dim=-1)
+        feat_lengths = torch.full((bs,), features.size(1), dtype=torch.float32, device=device)
+
+        features_mlp = self.mlp(features)
+        features_pooled = maxk_pool1d_var(features_mlp, 1, 1, feat_lengths)
+
+        new_base_features = l2norm(new_base_features, dim=-1)
+        output_features = features_pooled + new_base_features
+
+        return output_features.to(x_dtype)

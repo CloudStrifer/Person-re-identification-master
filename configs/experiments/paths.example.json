@@ -1,0 +1,15 @@
+{
+  "root_dir": "data",
+  "dataset_roots": {},
+  "clip_weights": ".recovery/model_cache/ViT-B-16.pt",
+  "bpe_path": "data/bpe_simple_vocab_16e6.txt.gz",
+  "augmentation_manifests": {
+    "Synth_PEDES": {},
+    "RSTPReid": {
+      "both": "data/augmentation/RSTPReid/train_manifest.json",
+      "unfiltered": "data/augmentation/RSTPReid/train_unfiltered_manifest.json"
+    },
+    "CUHK-PEDES": {"both": "data/augmentation/CUHK-PEDES/train_manifest.json"},
+    "ICFG-PEDES": {"both": "data/augmentation/ICFG-PEDES/train_manifest.json"}
+  }
+}
