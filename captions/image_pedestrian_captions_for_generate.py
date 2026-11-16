@@ -249,7 +249,7 @@ class QwenVLImageCaptioner:
 
 if __name__ == "__main__":
     # 配置参数
-    DASHSCOPE_API_KEY = "sk-820205eae5ec49abbd3e373a4f9384e8"  # 替换为你的API密钥
+    DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxx"  # 替换为你的API密钥
     ROOT_FOLDER_PATH = "E:/output_generate"  # 根文件夹路径（包含4100个子目录）
 
     # 初始化生成器并处理图片（支持断点续传）
