@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""NCHNet §3.2: per-ORIGINAL-image diffusion generation + CLIP Top-K filtering.
+
+Input:     training checkpoint with metadata.json, unet_lora.pt, embeddings.pt
+           original pedestrian photos organized by subject_id / images
+Default:   20 diffusion candidates for EACH original image, keep Top-10 to
+           the ORIGINAL IMAGE using frozen CLIP ViT-B/16 cosine similarity.
+Output:    candidate and selected PNGs, provenance manifest of every selected image.
+
+Generated photos must receive captions describing THEIR OWN content before
+being used as positive image-text pairs: DO NOT copy the source captions.
+
+Legacy LoRA format: designed for older diffusers LoRAAttnProcessor API.
+Use --self_test to test the scoring/ranking contract without loading models.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import shutil
+from pathlib import Path
+from typing import Any
+
+LOGGER = logging.getLogger("nchnet.imagegen")
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+# Ten different caption prompts, re-used in a 20-candidate cycle with independent seeds.
+# Includes viewpoint/pose/lighting variation, while keeping the subject token fixed.
+VIEW_PROMPTS = (
+    "a {random_id} photo of a {token} person, full body, front view",
+    "a {random_id} photo of a {token} person, full body, side view",
+    "a {random_id} photo of a {token} person, full body, rear view",
+    "a {random_id} photo of a {token} person walking, full body",
+    "a {random_id} photo of a {token} person standing, full body",
+    "a {random_id} photo of a {token} person, different camera angle",
+    "a {random_id} photo of a {token} person in outdoor daylight",
+    "a {random_id} photo of a {token} person in soft indoor light",
+    "a {random_id} photo of a {token} person, slight pose variation",
+    "a {random_id} full body photo of the {token} person",
+)
+
+
+def sha_seed(seed: int, key: str, i: int) -> int:
+    digest = hashlib.sha256(f"{seed}|{key}|{i}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % (2 ** 63)
+
+
+def _load_torch_checkpoint(path: Path) -> Any:
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # Legacy PyTorch; only load checkpoints produced by trusted local training.
+        return torch.load(path, map_location="cpu")
+
+
+def load_checkpoint(checkpoint_dir: Path) -> tuple[dict, dict, dict]:
+    folder = checkpoint_dir.resolve()
+    for name in ("metadata.json", "embeddings.pt", "unet_lora.pt"):
+        if not (folder / name).is_file():
+            raise FileNotFoundError(f"Missing {name} in {folder}")
+    meta = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    embeddings = _load_torch_checkpoint(folder / "embeddings.pt")
+    lora = _load_torch_checkpoint(folder / "unet_lora.pt")
+    required = {"subject_ids", "placeholder_tokens", "subject_random_ids"}
+    if not required.issubset(meta) or not meta["subject_random_ids"]:
+        raise ValueError("Checkpoint lacks dual-identifier subject metadata; use the matching training script")
+    if not isinstance(embeddings, dict) or not isinstance(lora, dict) or not lora:
+        raise ValueError("Invalid LoRA / text-inversion checkpoint tensors")
+    return meta, embeddings, lora
+
+
+def install_legacy_lora(pipe, weights: dict, rank: int) -> None:
+    """Restore ONLY cross-attention LoRA layers and fail on incomplete weights."""
+    try:
+        from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
+    except ImportError as e:
+        raise RuntimeError("Legacy LoRAAttnProcessor not available; install a compatible diffusers version (e.g. 0.21.x)") from e
+    processors = {}
+    for name, original in pipe.unet.attn_processors.items():
+        if name not in weights:
+            # Expected for frozen self-attention processors in the paper-aligned training script.
+            processors[name] = original
+            continue
+        if name.startswith("mid_block"):
+            hidden = pipe.unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            idx = int(name.split(".")[1]); hidden = list(reversed(pipe.unet.config.block_out_channels))[idx]
+        elif name.startswith("down_blocks"):
+            idx = int(name.split(".")[1]); hidden = pipe.unet.config.block_out_channels[idx]
+        else:
+            raise ValueError(f"Unrecognized UNet attention processor: {name}")
+        cross = None if name.endswith("attn1.processor") else pipe.unet.config.cross_attention_dim
+        processor = LoRAAttnProcessor(hidden_size=hidden, cross_attention_dim=cross, rank=rank)
+        params = dict(processor.named_parameters())
+        for param_name, tensor in weights[name].items():
+            if param_name not in params:
+                raise ValueError(f"Unknown LoRA tensor {name}/{param_name}; check diffusers version")
+            if params[param_name].shape != tensor.shape:
+                raise ValueError(f"Shape mismatch for {name}/{param_name}: expected {tuple(params[param_name].shape)}, "
+                                 f"got {tuple(tensor.shape)}; check --lora_rank and checkpoint")
+            with __import__("torch").no_grad():
+                params[param_name].copy_(tensor.to(dtype=params[param_name].dtype))
+        if set(params) != set(weights[name]):
+            raise ValueError(f"Incomplete LoRA checkpoint for {name}: missing {set(params) - set(weights[name])}")
+        processors[name] = processor
+    if set(weights) - set(processors):
+        raise ValueError("Checkpoint includes LoRA processor names not in the base model")
+    pipe.unet.set_attn_processor(processors)
+    LOGGER.info("Installed %d LoRA attention processors", len(weights))
+
+
+def install_text_embeddings(pipe, embeddings: dict, meta: dict) -> None:
+    for subject_id in meta["subject_ids"]:
+        token = meta["placeholder_tokens"][subject_id]
+        if token not in embeddings:
+            raise ValueError(f"Missing embedding for {token}")
+        added = pipe.tokenizer.add_tokens(token)
+        if added != 1:
+            raise ValueError(f"Placeholder {token!r} already exists in base tokenizer; expected newly added token")
+    pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+    import torch
+    with torch.no_grad():
+        weight = pipe.text_encoder.get_input_embeddings().weight
+        for subject_id in meta["subject_ids"]:
+            token = meta["placeholder_tokens"][subject_id]
+            index = pipe.tokenizer.convert_tokens_to_ids(token)
+            if tuple(weight[index].shape) != tuple(embeddings[token].shape):
+                raise ValueError(f"Text-inversion shape mismatch for {token}")
+            weight[index].copy_(embeddings[token].to(device=weight.device, dtype=weight.dtype))
+
+
+class CLIPImageFilter:
+    """A fixed 512-d ViT-B/16 visual encoder used on both source and candidate images."""
+    def __init__(self, model_path: str, device):
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+        self.device = device
+        self.processor = CLIPProcessor.from_pretrained(model_path)
+        self.model = CLIPModel.from_pretrained(model_path).to(device).eval()
+        patch = getattr(self.model.config.vision_config, "patch_size", None)
+        if patch != 16:
+            raise ValueError(f"Paper filtering requires CLIP ViT-B/16, got patch_size={patch}")
+        if int(self.model.config.projection_dim) != 512:
+            raise ValueError("Expected 512-dimensional CLIP features")
+        self.torch = torch
+
+    def encode(self, images: list[Any]):
+        inputs = self.processor(images=images, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with self.torch.inference_mode():
+            features = self.model.get_image_features(**inputs)
+            if not isinstance(features, self.torch.Tensor):
+                features = features.pooler_output  # safeguard for different model wrapper versions
+            return self.torch.nn.functional.normalize(features.float(), dim=-1).detach().cpu()
+
+
+def select_top_k(source_feature, candidate_features, k: int):
+    """Return (index, cosine) pairs sorted by cosine descending, then index ascending."""
+    import torch
+    if not isinstance(source_feature, torch.Tensor) or source_feature.ndim != 1:
+        raise ValueError("source_feature must be a single 1D tensor")
+    if candidate_features.ndim != 2 or candidate_features.shape[1] != source_feature.numel():
+        raise ValueError("candidate_features must be [N,D] matching source")
+    if not 1 <= k <= len(candidate_features):
+        raise ValueError("k must be in [1, num_candidates]")
+    v = torch.nn.functional.normalize(source_feature.float(), dim=0)
+    m = torch.nn.functional.normalize(candidate_features.float(), dim=1)
+    scores = (m @ v).tolist()
+    return sorted(enumerate(scores), key=lambda pair: (-pair[1], pair[0]))[:k]
+
+
+def safe_stem(source_key: str) -> str:
+    # Relative source key ensures the same output across machines and mount paths.
+    suffix = hashlib.sha256(source_key.encode()).hexdigest()[:8]
+    clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in Path(source_key).stem)
+    return f"{clean}_{suffix}"
+
+
+def make_pipeline(args, checkpoint, device):
+    import torch
+    from diffusers import StableDiffusionPipeline, DDIMScheduler
+    model_path = args.model_id or checkpoint[0].get("pretrained_model_name_or_path")
+    if not model_path:
+        raise ValueError("No Stable Diffusion base model specified; pass --model_id")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    pipe = StableDiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype)
+    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    rank = args.lora_rank or int(checkpoint[0].get("lora_rank", 128))
+    install_legacy_lora(pipe, checkpoint[2], rank)
+    install_text_embeddings(pipe, checkpoint[1], checkpoint[0])
+    pipe = pipe.to(device)
+    if args.enable_attention_slicing:
+        pipe.enable_attention_slicing()
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def generate_and_filter(args) -> None:
+    from PIL import Image
+    import torch
+    if not 1 <= args.top_k <= args.num_candidates:
+        raise ValueError("--top_k must lie between 1 and --num_candidates")
+    checkpoint = load_checkpoint(Path(args.checkpoint_dir))
+    meta = checkpoint[0]
+    sources = Path(args.source_dir).expanduser().resolve()
+    if not sources.is_dir():
+        raise FileNotFoundError(f"Original-image folder not found: {sources}")
+    output = Path(args.output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Requested cuda but no CUDA device is available")
+
+    # Use the SAME fixed CLIP encoder and preprocessing for original and candidates.
+    filter_model = CLIPImageFilter(args.clip_model, device)
+    pipe = make_pipeline(args, checkpoint, device)
+    selected_manifest = output / "selected_manifest.json"
+    records = json.loads(selected_manifest.read_text(encoding="utf-8")) if selected_manifest.is_file() else []
+    if not isinstance(records, list):
+        raise ValueError("selected_manifest.json must be a JSON list")
+    by_source = {r["source_image"]: r for r in records}
+    finished = 0
+
+    for subject_id in meta["subject_ids"]:
+        subject_dir = sources / subject_id
+        if not subject_dir.is_dir():
+            LOGGER.warning("Missing identity folder, skipping: %s", subject_dir)
+            continue
+        token = meta["placeholder_tokens"][subject_id]
+        random_id = meta["subject_random_ids"].get(subject_id)
+        if not random_id:
+            raise ValueError(f"Missing fixed random ID for {subject_id}; refusing to change trained identity prompt")
+        for source_path in sorted(p for p in subject_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS):
+            source_key = source_path.relative_to(sources).as_posix()
+            if args.limit_sources and finished >= args.limit_sources:
+                break
+            if source_key in by_source and not args.overwrite:
+                LOGGER.info("Already in manifest, skip: %s", source_key)
+                continue
+            source_group = safe_stem(source_key)
+            candidate_dir = output / "candidates" / subject_id / source_group
+            # Clean subtree for re-captioning only the selected new images:
+            selected_dir = output / "selected_only" / subject_id / source_group
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            selected_dir.mkdir(parents=True, exist_ok=True)
+            previews = []
+            for i in range(args.num_candidates):
+                filename = f"candidate_{i:03d}.png"
+                candidate_path = candidate_dir / filename
+                prompt = VIEW_PROMPTS[i % len(VIEW_PROMPTS)].format(random_id=random_id, token=token)
+                current_seed = sha_seed(args.seed, source_key, i)
+                if not candidate_path.is_file() or args.overwrite:
+                    generator = torch.Generator(device=device).manual_seed(current_seed)
+                    with torch.inference_mode():
+                        result = pipe(prompt, num_inference_steps=args.num_inference_steps,
+                                      guidance_scale=args.guidance_scale,
+                                      height=args.height, width=args.width, generator=generator)
+                    pic = result.images[0]
+                    pic.save(candidate_path)
+                previews.append({"path": candidate_path, "prompt": prompt, "seed": current_seed, "candidate_idx": i})
+            with Image.open(source_path) as source_img:
+                source = source_img.convert("RGB")
+                source_feature = filter_model.encode([source])[0]
+            chunks = []
+            for start in range(0, len(previews), args.clip_batch_size):
+                batch = []
+                for item in previews[start:start + args.clip_batch_size]:
+                    with Image.open(item["path"]) as im:
+                        batch.append(im.convert("RGB"))
+                chunks.append(filter_model.encode(batch))
+            feature_matrix = torch.cat(chunks, dim=0)
+            winners = select_top_k(source_feature, feature_matrix, args.top_k)
+            selected = []
+            for rank, (idx, score) in enumerate(winners, 1):
+                item = previews[idx]
+                selected_file = selected_dir / item["path"].name
+                if args.overwrite or not selected_file.is_file():
+                    shutil.copy2(item["path"], selected_file)
+                selected.append({"selected_path": str(selected_file.relative_to(output)),
+                                 "candidate_path": str(item["path"].relative_to(output)),
+                                 "candidate_index": item["candidate_idx"], "rank": rank,
+                                 "cosine_similarity": float(score), "prompt": item["prompt"], "seed": item["seed"]})
+            record = {
+                "source_image": source_key, "subject_id": subject_id, "source_pid": subject_id,
+                "source_image_absolute": str(source_path), "num_candidates": args.num_candidates,
+                "top_k": args.top_k, "filter_model": args.clip_model,
+                "caption_generated_images": False, "selected": selected,
+            }
+            by_source[source_key] = record
+            temp = selected_manifest.with_suffix(".json.tmp")
+            with temp.open("w", encoding="utf-8") as file:
+                json.dump(list(by_source.values()), file, ensure_ascii=False, indent=2)
+            os.replace(temp, selected_manifest)
+            finished += 1
+            LOGGER.info("%s: generated %d candidates and retained Top-%d", source_key, args.num_candidates, args.top_k)
+        if args.limit_sources and finished >= args.limit_sources:
+            break
+    if finished == 0:
+        LOGGER.warning("No new source images processed. Check input identity folder names and existing manifest.")
+    else:
+        LOGGER.info("Finished %d originals. Manifest: %s", finished, selected_manifest)
+    LOGGER.warning("Do NOT train image-text pairs on generated images without obtaining their own captions")
+
+
+
+def attach_generated_captions(output_dir: str, captions_file: str) -> None:
+    """Pair each selected generated image with descriptions of THAT GENERATED image.
+
+    `image_pedestrian_captions.py --image_folder <output>/selected_only --recursive`
+    produces relative keys e.g. `p001/source_hash/candidate_003.png`.
+    Never reuse a source original caption for the selected generated photo.
+    """
+    folder = Path(output_dir).resolve()
+    manifest_file = folder / 'selected_manifest.json'
+    if not manifest_file.is_file():
+        raise FileNotFoundError(f'Run generation first: {manifest_file}')
+    manifest = json.loads(manifest_file.read_text(encoding='utf8'))
+    captions = json.loads(Path(captions_file).read_text(encoding='utf8'))
+    pairs, missing = [], []
+    for group in manifest:
+        for selected in group['selected']:
+            relative_selected = Path(selected['selected_path'])
+            if not relative_selected.parts or relative_selected.parts[0] != 'selected_only':
+                raise ValueError('Unexpected selected image location')
+            caption_key = Path(*relative_selected.parts[1:]).as_posix()
+            descriptions = captions.get(caption_key)
+            if (not isinstance(descriptions, list) or len(descriptions) != 2
+                    or not all(isinstance(x, str) and x.strip() for x in descriptions)):
+                missing.append(caption_key)
+                continue
+            pairs.append({
+                'image_path': str(folder / relative_selected),
+                'source_image': group['source_image'],
+                'source_pid': group['source_pid'],
+                'captions': descriptions,
+                'cosine_similarity': selected['cosine_similarity'],
+                'candidate_index': selected['candidate_index'],
+                'image_origin': 'stable_diffusion_selected_topk',
+                'caption_origin': 'qwen_vl_generated_image_specific',
+            })
+    if missing:
+        raise ValueError(f'{len(missing)} selected generated images lack two own captions. '
+                         f'First examples: {missing[:5]}')
+    destination = folder / 'augmented_image_text_pairs.json'
+    temporary = destination.with_suffix('.tmp')
+    temporary.write_text(json.dumps(pairs, indent=2, ensure_ascii=False), encoding='utf8')
+    os.replace(temporary, destination)
+    LOGGER.info('Wrote %d complete selected-image/text pairs to %s', len(pairs), destination)
+
+
+def self_test() -> None:
+    import torch
+    src = torch.tensor([1., 0.])
+    candidates = torch.tensor([[1., 0.], [0., 1.], [0.9, 0.1], [-1., 0.]])
+    ranks = select_top_k(src, candidates, 2)
+    assert [i for i, _ in ranks] == [0, 2], ranks
+    assert len(VIEW_PROMPTS) == 10
+    print("Per-original-image Top-K cosine self-test passed:", ranks)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint_dir", default="multi_subject_lora_output/final_model")
+    parser.add_argument("--model_id", default=None, help="SD 1.5 path; defaults to training metadata model path")
+    parser.add_argument("--source_dir", default="Organize_Pedestrians-300", help="Original photos grouped in subject_id folders")
+    parser.add_argument("--output_dir", default="generated_images")
+    parser.add_argument("--clip_model", default="openai/clip-vit-base-patch16", help="Frozen CLIP ViT-B/16 model ID or local directory")
+    parser.add_argument("--num_candidates", type=int, default=20, help="N_gen per ORIGINAL image")
+    parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument("--clip_batch_size", type=int, default=8)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--lora_rank", type=int, default=None, help="Defaults to training checkpoint metadata (128)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--limit_sources", type=int, default=0, help="Small GPU smoke test: e.g. 1 original image")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--enable_attention_slicing", action="store_true")
+    parser.add_argument("--attach_generated_captions", default=None,
+                        help="After Qwen captions for selected_only, merge into augmented_image_text_pairs.json without generating")
+    parser.add_argument("--self_test", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if args.self_test:
+        self_test()
+    elif args.attach_generated_captions:
+        attach_generated_captions(args.output_dir, args.attach_generated_captions)
+    else:
+        generate_and_filter(args)
+
+
+if __name__ == "__main__":
+    main()
