@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""NCHNet §3.2: visual-attribute extraction + 30-template infilling.
+
+Unlike the historical reference-template prompt, this implementation explicitly:
+  (1) extracts image-grounded attributes with Qwen-VL-Max via DashScope,
+  (2) selects two distinct templates out of a fixed pool of 30,
+  (3) deterministically fills their optional attribute clauses.
+
+Only observations supported by the image are accepted. No API secrets in source.
+Run --help or --self_test without external dependencies/services.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+LOGGER = logging.getLogger("nchnet.text")
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+ATTRIBUTE_KEYS = (
+    "gender", "age", "physical_trait", "hair", "upper_clothing", "lower_clothing",
+    "footwear", "clothing_type", "clothing_color", "clothing_material",
+    "accessories", "carried_items", "action", "posture", "background", "scene",
+)
+
+# Exactly 30 different syntactic templates; representative categories follow the supplement.
+# The full template pool is authored once; Qwen extracts the attributes to fill it.
+@dataclass(frozen=True)
+class Template:
+    template_id: str
+    category: str
+    form: str
+
+
+TEMPLATES = (
+    # Active / action-oriented (1--10). Every frame accepts a noun phrase + relative clause.
+    Template("01", "active", "The photograph shows {subject}{relative}."),
+    Template("02", "active", "In this picture, one can see {subject}{relative}."),
+    Template("03", "active", "The camera captures {subject}{relative}."),
+    Template("04", "active", "The scene features {subject}{relative}."),
+    Template("05", "active", "Here the viewer sees {subject}{relative}."),
+    Template("06", "active", "The image depicts {subject}{relative}."),
+    Template("07", "active", "The picture includes {subject}{relative}."),
+    Template("08", "active", "The frame contains {subject}{relative}."),
+    Template("09", "active", "This photograph presents {subject}{relative}."),
+    Template("10", "active", "The photograph records {subject}{relative}."),
+    # Apparel-first descriptions (11--20): only chosen when an outfit is extracted.
+    Template("11", "descriptive", "Dressed in {outfit}, {subject} is pictured{extras}."),
+    Template("12", "descriptive", "The picture shows {subject} dressed in {outfit}{extras}."),
+    Template("13", "descriptive", "An important clothing detail is {outfit}; the wearer is {subject}{extras}."),
+    Template("14", "descriptive", "In the frame, {subject} appears dressed in {outfit}{extras}."),
+    Template("15", "descriptive", "Dressed in {outfit}, {subject} is shown{extras}."),
+    Template("16", "descriptive", "The photographed individual is {subject}, dressed in {outfit}{extras}."),
+    Template("17", "descriptive", "The person's attire consists of {outfit}; {subject} is visible{extras}."),
+    Template("18", "descriptive", "The visible person is {subject} dressed in {outfit}{extras}."),
+    Template("19", "descriptive", "Among the scene's details, {subject} wears {outfit}{extras}."),
+    Template("20", "descriptive", "The photograph highlights {subject} wearing {outfit}{extras}."),
+    # Detail-oriented / local-attribute-first (21--30).
+    Template("21", "details", "Key visible details include {details}."),
+    Template("22", "details", "The person's identifiable visual attributes include {details}."),
+    Template("23", "details", "Noticeable features of the pedestrian are {details}."),
+    Template("24", "details", "The image reveals the following features: {details}."),
+    Template("25", "details", "Visual evidence shows {details}."),
+    Template("26", "details", "Appearance details in the image include {details}."),
+    Template("27", "details", "Distinct visible cues consist of {details}."),
+    Template("28", "details", "The pedestrian can be described through {details}."),
+    Template("29", "details", "Observed characteristics comprise {details}."),
+    Template("30", "details", "Among the observable cues are {details}."),
+)
+assert len(TEMPLATES) == 30 and len({x.template_id for x in TEMPLATES}) == 30
+
+
+def _clean(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    s = re.sub(r"\s+", " ", value).strip(" .;,:\"'\n\r\t")
+    return "" if s.lower() in {"null", "none", "unknown", "n/a", "not visible", "unclear", "unspecified", "no"} else s
+
+
+def normalize_attributes(raw: Mapping[str, Any]) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        raise ValueError("Qwen must return a JSON object of observed attributes")
+    return {key: _clean(raw.get(key)) for key in ATTRIBUTE_KEYS}
+
+
+def join_items(items: list[str]) -> str:
+    xs = [s for s in items if s]
+    if not xs:
+        return ""
+    if len(xs) == 1:
+        return xs[0]
+    return ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
+def _subject(a: Mapping[str, str]) -> str:
+    gender = a.get("gender", "").lower()
+    if gender in {"male", "man"}:
+        return "a man"
+    if gender in {"female", "woman"}:
+        return "a woman"
+    return "a pedestrian"
+
+
+def _outfit(a: Mapping[str, str]) -> str:
+    items = [a.get(k, "") for k in ("upper_clothing", "lower_clothing", "footwear")]
+    items = [s for s in items if s]
+    if not items and a.get("clothing_type"):
+        items = [" ".join(filter(None, [a.get("clothing_color", ""), a.get("clothing_material", ""), a["clothing_type"]]))]
+    return join_items(items)
+
+
+def render_caption(template: Template, attrs: Mapping[str, str]) -> str:
+    a = normalize_attributes(attrs)
+    subject, outfit = _subject(a), _outfit(a)
+    if not any(a.values()):
+        raise ValueError("No observed attributes; refusing to invent a caption")
+    if template.category == "descriptive" and not outfit:
+        raise ValueError("Apparel-first template requires a visually supported outfit")
+    # All relative/extra clauses are composed from observed attributes only.
+    actions = []
+    if outfit:
+        actions.append("wearing " + outfit)
+    if a["carried_items"]:
+        actions.append("carrying " + a["carried_items"])
+    if a["action"]:
+        actions.append(a["action"])
+    relative = " who is " + join_items(actions) if actions else " who is visible"
+    addenda = []
+    if a["carried_items"]:
+        addenda.append("carrying " + a["carried_items"])
+    if a["action"]:
+        addenda.append(a["action"])
+    extras = (", " + ", ".join(addenda)) if addenda else ""
+    details = join_items([
+        v for v in (outfit, a["carried_items"], a["accessories"], a["hair"],
+                  a["physical_trait"], a["age"], a["action"], a["posture"],
+                  a["scene"] or a["background"]) if v
+    ])
+    if template.category == "active":
+        s = template.form.format(subject=subject, relative=relative)
+    elif template.category == "descriptive":
+        s = template.form.format(outfit=outfit, subject=subject, extras=extras)
+    else:
+        if not details:
+            raise ValueError("Detail-oriented template requires an observable appearance attribute")
+        s = template.form.format(details=details)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def select_two_templates(attrs: Mapping[str, str], image_key: str, seed: int = 42) -> tuple[list[str], list[str]]:
+    """Deterministic two distinct templates; try alternative templates if wording collapses."""
+    token = hashlib.sha256(f"{seed}|{image_key}".encode("utf-8")).digest()
+    shuffled = list(TEMPLATES)
+    random.Random(int.from_bytes(token[:8], "big")).shuffle(shuffled)
+    captions, ids = [], []
+    for template in shuffled:
+        try:
+            caption = render_caption(template, attrs)
+        except ValueError:
+            continue
+        if caption not in captions:
+            captions.append(caption)
+            ids.append(template.template_id)
+        if len(captions) == 2:
+            break
+    if len(captions) != 2:
+        raise ValueError("Could not produce two distinct grounded captions")
+    return captions, ids
+
+
+def _extract_json(content: str) -> dict:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError("Qwen did not return valid attribute JSON") from e
+    if not isinstance(value, dict):
+        raise ValueError("Qwen returned a non-object JSON value")
+    return value
+
+
+class QwenVLImageCaptioner:
+    def __init__(self, api_key: str | None = None, model: str = "qwen-vl-max", attempts: int = 3):
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise SystemExit("Please install the 'openai' package: pip install openai") from e
+        key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        if not key:
+            raise ValueError("Set the DASHSCOPE_API_KEY environment variable; never place keys in code")
+        self.client = OpenAI(api_key=key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", timeout=90)
+        self.model, self.attempts = model, attempts
+
+    @staticmethod
+    def image_to_data_url(path: Path) -> str:
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+    def extract_attributes(self, image: Path) -> dict[str, str]:
+        schema = {key: "" for key in ATTRIBUTE_KEYS}
+        instruction = (
+            "Analyze the visible pedestrian. Return ONLY one JSON object with exactly the following string keys: "
+            + json.dumps(schema, ensure_ascii=False)
+            + " . Describe each field only if it is clearly observable in the image. "
+              "Use empty strings for invisible or uncertain facts. "
+              "Do not invent accessories, age, colors, actions, materials, scene or identity. "
+              "Use brief English natural-language values for clothing and belongings. "
+              "For gender use male/female only if visually evident, otherwise empty string."
+        )
+        last_error = None
+        for attempt in range(self.attempts):
+            try:
+                result = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": instruction},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": self.image_to_data_url(image), "detail": "high"}},
+                            {"type": "text", "text": "Return the pedestrian's visible attributes in JSON. No prose."},
+                        ]},
+                    ],
+                    temperature=0,
+                    max_tokens=600,
+                )
+                content = result.choices[0].message.content
+                attrs = normalize_attributes(_extract_json(content))
+                if not any(attrs.values()):
+                    raise ValueError("All extracted attribute fields are empty")
+                return attrs
+            except Exception as err:
+                last_error = err
+                LOGGER.warning("Qwen extraction failed for %s (attempt %d/%d): %s", image, attempt + 1, self.attempts, err)
+                if attempt + 1 < self.attempts:
+                    time.sleep(min(2 ** attempt, 8))
+        raise RuntimeError(f"Failed to extract grounded attributes from {image}: {last_error}")
+
+
+def atomic_json_dump(obj: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(temp, path)
+
+
+def process_folder(args: argparse.Namespace) -> None:
+    root = Path(args.image_folder).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Image folder not found: {root}")
+    result_path = Path(args.output_file)
+    attr_path = Path(args.attributes_file or result_path.with_suffix(".attributes.json"))
+    results = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+    records = json.loads(attr_path.read_text(encoding="utf-8")) if attr_path.is_file() else {}
+    if not isinstance(results, dict) or not isinstance(records, dict):
+        raise ValueError("Existing output must be JSON dictionaries")
+    files = sorted(p for p in (root.rglob("*") if args.recursive else root.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+    captioner = QwenVLImageCaptioner(model=args.model)
+    finished = 0
+    for path in files:
+        key = path.relative_to(root).as_posix()
+        if key in results and len(results[key]) == 2 and key in records and not args.force:
+            continue
+        if args.limit and finished >= args.limit:
+            break
+        try:
+            attrs = captioner.extract_attributes(path)
+            captions, template_ids = select_two_templates(attrs, key, args.seed)
+            records[key] = {"attributes": attrs, "template_ids": template_ids, "model": args.model, "seed": args.seed}
+            results[key] = captions
+            atomic_json_dump(results, result_path)
+            atomic_json_dump(records, attr_path)
+            finished += 1
+            LOGGER.info("%s -> [%s] %s", key, ",".join(template_ids), captions)
+        except Exception as err:
+            LOGGER.error("SKIP %s: %s (error text is NOT saved as a caption)", key, err)
+            if args.fail_fast:
+                raise
+    LOGGER.info("Newly generated: %d; total saved: %d", finished, len(results))
+
+
+def self_test() -> None:
+    attrs = {"gender": "male", "upper_clothing": "a red jacket", "lower_clothing": "black trousers", "carried_items": "a backpack", "action": "walking"}
+    a, ids = select_two_templates(attrs, "person1/01.jpg", 42)
+    assert len(a) == 2 and len(set(a)) == 2 and len(set(ids)) == 2
+    assert a == select_two_templates(attrs, "person1/01.jpg", 42)[0]
+    assert all("red jacket" in s for s in a)
+    print("Text template self-test passed. IDs:", ids)
+    for text in a:
+        print(" ", text)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image_folder", default="data/RSTPReid/imgs")
+    parser.add_argument("--output_file", default="pedestrian_captions_paper_aligned.json")
+    parser.add_argument("--attributes_file", default=None, help="Provenance JSON next to caption JSON by default")
+    parser.add_argument("--model", default="qwen-vl-max", help="Can also pass qwen-vl-max-latest, but record exact model/version")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--recursive", action="store_true", help="Read identity subfolders recursively")
+    parser.add_argument("--limit", type=int, default=0, help="For a small real API test")
+    parser.add_argument("--force", action="store_true", help="Regenerate existing records")
+    parser.add_argument("--fail_fast", action="store_true")
+    parser.add_argument("--self_test", action="store_true", help="No API call or file access")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if args.self_test:
+        self_test()
+    else:
+        process_folder(args)
+
+
+if __name__ == "__main__":
+    main()
